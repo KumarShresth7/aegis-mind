@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -26,7 +27,7 @@ func NewProxyHandler() *ProxyHandler {
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
 			},
-		}
+		},
 	}
 }
 
