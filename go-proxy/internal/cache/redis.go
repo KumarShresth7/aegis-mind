@@ -31,7 +31,6 @@ func NewSemanticCache() *SemanticCache {
 	return cache
 }
 
-
 func (sc *SemanticCache) InitializeIndex() {
 	schema := []interface{}{
 		"FT.CREATE", "idx:prompts",
@@ -54,3 +53,48 @@ func (sc *SemanticCache) InitializeIndex() {
 	}
 }
 
+func (sc *SemanticCache) CheckCache(vector []float32) (string, bool){
+	vectorBytes := float32ArrayToBytes(vector)
+
+	query := []interface{}{
+		"FT.SEARCH", "idx:prompts", "*=>[KNN 1 @embedding $query_vec AS similarity]",
+		"PARAMS", "2", "query_vec", vectorBytes,
+		"RETURN", "2", "similarity", "response_text",
+		"DIALECT", "2",
+	}
+
+	res, err := sc.client.Do(sc.ctx, query...).Slice()
+	if err != nil {
+		log.Printf("[Redis] Search error: %v", err)
+		return "", false
+	}
+
+	if len(res) > 1 && res[0].(int64) > 0 {
+		props := res[2].([]interface{})
+		var similarity float64
+		var cachedResponse string
+
+		for i := 0; i < len(props); i += 2 {
+			key := props[i].(string)
+			if key == "similarity" {
+				fmt.Sscanf(props[i+1].(string), "%f", &similarity)
+			} else if key == "response_text" {
+				cachedResponse = props[i+1].(string)
+			}
+		}
+
+		if similarity < 0.05 {
+			log.Printf("[Cache HIT] Semantic match found! Distance: %f", similarity)
+			return cachedResponse, true
+		}
+	}
+
+	return "", false
+}
+
+func float32ArrayToBytes(floats []float32) []byte {
+	// Implementation omitted for brevity - uses encoding/binary to convert
+	// the float array into a byte slice to pass into the Redis query.
+	// You can use standard `binary.Write` here.
+	return []byte{} 
+}

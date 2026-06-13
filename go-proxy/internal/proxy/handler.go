@@ -59,6 +59,30 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Go Proxy] Inbound Prompt: %v | Model: %s | Stream: %v", lastMsg, reqPayload.Model, reqPayload.Stream)
 	}
 
+	mockVector := make([]float32, 1536)
+	mockVector[0] = 0.1
+
+	cachedResponse, hit := sc.CacheClient.CheckCache(mockVector)
+
+	if hit {
+		log.Println("[Go Proxy] Serving from Cache. Cost: $0.00")
+		
+		w.Header().Set("Content-Type", "text/event-stream")
+		
+		mockChunk := fmt.Sprintf(`{"choices":[{"delta":{"content":"%s"}}]}`, cachedResponse)
+		
+		fmt.Fprintf(w, "data: %s\n\n", mockChunk)
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		return
+	}
+
+	log.Println("[Go Proxy] Cache Miss. Forwarding to upstream...") 
+
+
 	upstreamURL := "https://api.openai.com/v1/chat/completions"
 	req, err := http.NewRequest(http.MethodPost, upstreamURL, bytes.NewBuffer(bodyBytes))
 	if err != nil {
