@@ -4,23 +4,33 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
+
+	"aegismind-proxy/internal/cache"
+	"aegismind-proxy/internal/embeddings"
+	"aegismind-proxy/internal/telemetry"
 )
 
 type ProxyHandler struct {
-	Client *http.Client
+	Client      *http.Client
+	CacheClient *cache.SemanticCache
+	WorkerURL   string
+	Telemetry   *telemetry.Store
+	Embeddings  *embeddings.Client
 }
 
 type ChatCompletionRequest struct {
-	Model string `json:"model"`
+	Model    string                   `json:"model"`
 	Messages []map[string]interface{} `json:"messages"`
-	Stream bool `json:"stream"`
+	Stream   bool                     `json:"stream"`
 }
 
-func NewProxyHandler() *ProxyHandler {
+func NewProxyHandler(cacheClient *cache.SemanticCache, workerURL string, tel *telemetry.Store, embedClient *embeddings.Client) *ProxyHandler {
 	return &ProxyHandler{
 		Client: &http.Client{
 			Timeout: 60 * time.Second,
@@ -28,10 +38,84 @@ func NewProxyHandler() *ProxyHandler {
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
 			},
 		},
+		CacheClient: cacheClient,
+		WorkerURL:   workerURL,
+		Telemetry:   tel,
+		Embeddings:  embedClient,
 	}
 }
 
+func extractPromptText(messages []map[string]interface{}) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	content, ok := messages[len(messages)-1]["content"]
+	if !ok {
+		return ""
+	}
+	if s, ok := content.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", content)
+}
+
+func parseSSEContent(chunk []byte) string {
+	var sb strings.Builder
+	for _, line := range bytes.Split(chunk, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[6:])
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+
+		var parsed struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(payload, &parsed); err != nil {
+			continue
+		}
+		for _, choice := range parsed.Choices {
+			if choice.Delta.Content != "" {
+				sb.WriteString(choice.Delta.Content)
+			}
+			if choice.Message.Content != "" {
+				sb.WriteString(choice.Message.Content)
+			}
+		}
+	}
+	return sb.String()
+}
+
+func parseJSONContent(body []byte) string {
+	var parsed struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, choice := range parsed.Choices {
+		sb.WriteString(choice.Message.Content)
+	}
+	return sb.String()
+}
+
 func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -44,7 +128,6 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body.Close()
-
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 	var reqPayload ChatCompletionRequest
@@ -54,45 +137,49 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(reqPayload.Messages) > 0 {
-		lastMsg := reqPayload.Messages[len(reqPayload.Messages)-1]["content"]
-		log.Printf("[Go Proxy] Inbound Prompt: %v | Model: %s | Stream: %v", lastMsg, reqPayload.Model, reqPayload.Stream)
+	promptText := extractPromptText(reqPayload.Messages)
+	if promptText != "" {
+		log.Printf("[Go Proxy] Inbound Prompt: %s | Model: %s | Stream: %v", promptText, reqPayload.Model, reqPayload.Stream)
 	}
 
-	mockVector := make([]float32, 1536)
-	mockVector[0] = 0.1
+	if promptText != "" && ph.Embeddings != nil {
+		queryVector, err := ph.Embeddings.EmbedQuery(promptText)
+		if err != nil {
+			log.Printf("[Embedding] Query embed failed, skipping cache: %v", err)
+		} else {
+			cachedResponse, distance, matchedPrompt, hit := ph.CacheClient.CheckCache(queryVector)
+			if hit {
+				latencyMs := time.Since(start).Milliseconds()
+				ph.Telemetry.RecordCacheHit(latencyMs, distance, matchedPrompt)
 
-	cachedResponse, hit := sc.CacheClient.CheckCache(mockVector)
+				log.Printf("[Go Proxy] Serving from Cache (similarity distance=%.4f)", distance)
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("X-AegisMind-Cache", "HIT")
+				w.Header().Set("X-AegisMind-Similarity", fmt.Sprintf("%.4f", distance))
+				w.Header().Set("X-AegisMind-Latency-Ms", fmt.Sprintf("%d", latencyMs))
 
-	if hit {
-		log.Println("[Go Proxy] Serving from Cache. Cost: $0.00")
-		
-		w.Header().Set("Content-Type", "text/event-stream")
-		
-		mockChunk := fmt.Sprintf(`{"choices":[{"delta":{"content":"%s"}}]}`, cachedResponse)
-		
-		fmt.Fprintf(w, "data: %s\n\n", mockChunk)
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
+				mockChunk := fmt.Sprintf(`{"choices":[{"delta":{"content":%s}}]}`, jsonString(cachedResponse))
+				fmt.Fprintf(w, "data: %s\n\n", mockChunk)
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				return
+			}
 		}
-		return
 	}
 
-	log.Println("[Go Proxy] Cache Miss. Forwarding to upstream...") 
+	log.Println("[Go Proxy] Cache Miss. Forwarding to worker...")
+	w.Header().Set("X-AegisMind-Cache", "MISS")
 
-
-	upstreamURL := "https://api.openai.com/v1/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, upstreamURL, bytes.NewBuffer(bodyBytes))
+	req, err := http.NewRequest(http.MethodPost, ph.WorkerURL, bytes.NewBuffer(bodyBytes))
 	if err != nil {
 		log.Printf("[Proxy Error] Outbound creation failed: %v", err)
 		http.Error(w, "Internal proxy error", http.StatusInternalServerError)
 		return
 	}
-
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", r.Header.Get("Authorization"))
 
 	resp, err := ph.Client.Do(req)
 	if err != nil {
@@ -107,7 +194,13 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(k, val)
 		}
 	}
+
+	latencyMs := time.Since(start).Milliseconds()
+	ph.Telemetry.RecordRequest(false, latencyMs)
+	w.Header().Set("X-AegisMind-Latency-Ms", fmt.Sprintf("%d", latencyMs))
 	w.WriteHeader(resp.StatusCode)
+
+	var responseBuilder strings.Builder
 
 	if reqPayload.Stream {
 		flusher, ok := w.(http.Flusher)
@@ -117,12 +210,12 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		buffer := make([]byte, 1024)
-
 		for {
 			n, err := resp.Body.Read(buffer)
 			if n > 0 {
-				_, wErr := w.Write(buffer[:n])
-				if wErr != nil {
+				chunk := buffer[:n]
+				responseBuilder.WriteString(parseSSEContent(chunk))
+				if _, wErr := w.Write(chunk); wErr != nil {
 					log.Printf("[Proxy Warning] Client disconnected early from stream")
 					return
 				}
@@ -137,12 +230,33 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		_, err := io.Copy(w, resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
+			log.Printf("[Proxy Error] Response body read failed: %v", err)
+			return
+		}
+		fullText := parseJSONContent(body)
+		if fullText == "" {
+			fullText = string(body)
+		}
+		responseBuilder.WriteString(fullText)
+		if _, err := w.Write(body); err != nil {
 			log.Printf("[Proxy Error] Response body copy failed: %v", err)
 			return
 		}
 	}
+
+	if fullResponse := strings.TrimSpace(responseBuilder.String()); fullResponse != "" && promptText != "" && ph.Embeddings != nil {
+		docVector, err := ph.Embeddings.EmbedDocument(promptText)
+		if err != nil {
+			log.Printf("[Embedding] Document embed failed, response not cached: %v", err)
+		} else {
+			ph.CacheClient.Store(promptText, fullResponse, docVector)
+		}
+	}
 }
 
-
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
